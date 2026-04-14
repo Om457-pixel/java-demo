@@ -1,0 +1,392 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import seaborn as sns
+from fpdf import FPDF
+from io import BytesIO
+import base64
+
+# Initialize session state
+if 'report_sections' not in st.session_state:
+    st.session_state.report_sections = []
+
+class AutomatedDataReporter:
+    def __init__(self):
+        self.data = None
+    
+    def load_data(self, uploaded_file):
+        """Load data from uploaded file"""
+        try:
+            self.data = pd.read_csv(uploaded_file)
+            st.session_state.report_sections.append(
+                ("Data Loading", 
+                 f"Successfully loaded data with {self.data.shape[0]} rows and {self.data.shape[1]} columns.",
+                 self.data.head().to_markdown())
+            )
+            with st.expander("Initial Data Sample"):
+                st.dataframe(self.data.head())
+        except Exception as e:
+            st.error(f"Error loading data: {str(e)}")
+            raise
+    
+    def clean_data(self):
+        """Perform data cleaning with Streamlit display"""
+        if self.data is None:
+            st.warning("No data loaded")
+            return
+            
+        original_shape = self.data.shape
+        explanations = []
+        cleaning_details = []
+        
+        with st.spinner("Cleaning data..."):
+            # Handle missing values
+            missing_values = self.data.isnull().sum()
+            if missing_values.sum() > 0:
+                explanations.append(f"Found {missing_values.sum()} missing values across columns.")
+                for col in self.data.columns:
+                    if self.data[col].isnull().sum() > 0:
+                        if self.data[col].dtype in ['float64', 'int64']:
+                            median_val = self.data[col].median()
+                            self.data[col].fillna(median_val, inplace=True)
+                            cleaning_details.append([col, "Median", f"{median_val:.2f}"])
+                        else:
+                            mode_val = self.data[col].mode()[0]
+                            self.data[col].fillna(mode_val, inplace=True)
+                            cleaning_details.append([col, "Mode", str(mode_val)])
+            
+            # Remove duplicates
+            duplicates = self.data.duplicated().sum()
+            if duplicates > 0:
+                self.data.drop_duplicates(inplace=True)
+                cleaning_details.append(["All", "Duplicates Removed", str(duplicates)])
+        
+        # Display cleaning report
+        if explanations or duplicates > 0:
+            cleaning_df = pd.DataFrame(cleaning_details, columns=["Column", "Action", "Value"])
+            report = (
+                f"Data shape changed from {original_shape} to {self.data.shape}\n\n"
+                f"Cleaning Actions:\n{cleaning_df.to_markdown(index=False)}"
+            )
+            st.session_state.report_sections.append(("Data Cleaning", report, cleaning_df.to_markdown()))
+            st.success("Data cleaning completed!")
+            
+            st.dataframe(cleaning_df)
+        else:
+            st.session_state.report_sections.append(("Data Cleaning", "No cleaning needed", ""))
+            st.info("Data was already clean")
+
+    def analyze_data(self):
+        """Interactive data analysis with Streamlit components"""
+        if self.data is None:
+            st.warning("No data loaded")
+            return
+            
+        analysis_results = []
+        
+        with st.spinner("Analyzing data..."):
+            # Basic statistics
+            numeric_cols = self.data.select_dtypes(include=['float64', 'int64']).columns
+            if len(numeric_cols) > 0:
+                st.subheader("Descriptive Statistics")
+                stats = self.data[numeric_cols].describe().transpose()
+                stats_markdown = stats.to_markdown(floatfmt=".2f")
+                st.session_state.report_sections.append(("Descriptive Statistics", "", stats_markdown))
+                st.dataframe(stats.style.format("{:.2f}"))
+                
+                # Correlation analysis
+                if len(numeric_cols) > 1:
+                    st.subheader("Correlation Analysis")
+                    corr_matrix = self.data[numeric_cols].corr()
+                    
+                    fig, ax = plt.subplots(figsize=(10, 8))
+                    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, ax=ax, fmt=".2f")
+                    st.pyplot(fig)
+                    
+                    # Find strongest correlations
+                    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+                    strongest_pairs = upper.stack().sort_values(ascending=False).head(3)
+                    strongest_pairs = strongest_pairs[abs(strongest_pairs) > 0.5]
+                    
+                    if not strongest_pairs.empty:
+                        st.write("**Strongest Correlations:**")
+                        corr_df = pd.DataFrame([(var1, var2, f"{corr:.2f}") 
+                                              for (var1, var2), corr in strongest_pairs.items()],
+                                             columns=["Variable 1", "Variable 2", "Correlation"])
+                        st.dataframe(corr_df)
+                        st.session_state.report_sections.append(
+                            ("Strongest Correlations", "", corr_df.to_markdown(index=False))
+                        )
+            
+            # Categorical analysis
+            cat_cols = self.data.select_dtypes(include=['object', 'category']).columns
+            if len(cat_cols) > 0:
+                for col in cat_cols:
+                    st.subheader(f"Categorical Analysis: {col}")
+                    value_counts = self.data[col].value_counts().head(10)
+                    
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    value_counts.plot(kind='bar', ax=ax)
+                    plt.xticks(rotation=45)
+                    st.pyplot(fig)
+                    
+                    st.dataframe(value_counts)
+                    st.session_state.report_sections.append(
+                        (f"Categorical Analysis: {col}", "", value_counts.to_markdown())
+                    )
+            else:
+                st.info("No categorical columns found for analysis")
+    
+    def generate_clusters(self):
+        """Interactive clustering with Streamlit"""
+        if self.data is None:
+            st.warning("No data loaded")
+            return
+            
+        # Check for missing values again (in case cleaning wasn't run)
+        if self.data.isnull().any().any():
+            st.warning("Data contains missing values. Running cleaning first...")
+            self.clean_data()
+        
+        numeric_cols = self.data.select_dtypes(include=['float64', 'int64']).columns
+        if len(numeric_cols) < 2:
+            st.warning("Not enough numeric columns for clustering")
+            return
+            
+        st.subheader("Clustering Analysis")
+        n_clusters = st.slider("Number of clusters", 2, 10, 3)
+        
+        with st.spinner("Generating clusters..."):
+            # Standardize data
+            scaler = StandardScaler()
+            scaled_data = scaler.fit_transform(self.data[numeric_cols])
+            
+            # Verify no NaN values remain
+            if np.isnan(scaled_data).any():
+                st.error("Data still contains NaN values after cleaning. Please handle missing values first.")
+                return
+                
+            # Perform clustering
+            try:
+                kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+                clusters = kmeans.fit_predict(scaled_data)
+                
+                # Remove existing cluster column if it exists
+                if 'cluster' in self.data.columns:
+                    self.data.drop('cluster', axis=1, inplace=True)
+                    
+                self.data['cluster'] = clusters
+                
+                # Visualize clusters
+                if len(numeric_cols) >= 2:
+                    x_col = st.selectbox("X-axis", numeric_cols, index=0)
+                    y_col = st.selectbox("Y-axis", numeric_cols, index=1)
+                    
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    sns.scatterplot(
+                        x=self.data[x_col], 
+                        y=self.data[y_col], 
+                        hue=clusters,
+                        palette='viridis',
+                        ax=ax
+                    )
+                    plt.title(f"Cluster Visualization ({x_col} vs {y_col})")
+                    st.pyplot(fig)
+                
+                # Show cluster stats
+                st.write("**Cluster Characteristics (mean values):**")
+                cluster_stats = self.data.groupby('cluster')[numeric_cols].mean()
+                formatted_stats = cluster_stats.style.format("{:.2f}")
+                st.dataframe(formatted_stats)
+                
+                st.session_state.report_sections.append(
+                    ("Clustering Analysis", 
+                     f"Number of clusters: {n_clusters}",
+                     cluster_stats.to_markdown(floatfmt=".2f"))
+                )
+                
+            except ValueError as e:
+                st.error(f"Clustering failed: {str(e)}")
+                st.info("Make sure your data is properly cleaned and contains no missing values")
+    
+    def predict_target(self):
+        """Interactive prediction with Streamlit"""
+        if self.data is None:
+            st.warning("No data loaded")
+            return
+            
+        numeric_cols = self.data.select_dtypes(include=['float64', 'int64']).columns
+        if len(numeric_cols) < 2:
+            st.warning("Not enough numeric columns for prediction")
+            return
+            
+        st.subheader("Prediction Analysis")
+        target_col = st.selectbox("Select target variable", numeric_cols)
+        feature_cols = [col for col in numeric_cols if col != target_col]
+        
+        if not feature_cols:
+            st.warning("No features available after selecting target variable")
+            return
+            
+        with st.spinner("Training model..."):
+            X = self.data[feature_cols]
+            y = self.data[target_col]
+            
+            model = RandomForestRegressor(random_state=42)
+            model.fit(X, y)
+            
+            # Get feature importance
+            importance = pd.DataFrame({
+                'Feature': feature_cols,
+                'Importance': model.feature_importances_
+            }).sort_values('Importance', ascending=False)
+            
+            # Visualize feature importance
+            fig, ax = plt.subplots(figsize=(8, 4))
+            sns.barplot(x='Importance', y='Feature', data=importance, ax=ax)
+            plt.title("Feature Importance for Prediction")
+            st.pyplot(fig)
+            
+            st.write("**Most Important Features:**")
+            formatted_importance = importance.style.format({"Importance": "{:.4f}"})
+            st.dataframe(formatted_importance)
+            
+            st.session_state.report_sections.append(
+                ("Prediction Analysis", 
+                 f"Target variable: {target_col}",
+                 importance.to_markdown(floatfmt=".4f", index=False))
+            )
+
+def create_pdf(report_sections):
+    """Generate PDF report with proper tables"""
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    
+    # Title
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(200, 10, txt="Data Analysis Report", ln=1, align='C')
+    pdf.set_font("Arial", size=12)
+    
+    # Content
+    for title, description, table_content in report_sections:
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(200, 10, txt=title, ln=1, align='L')
+        pdf.set_font("Arial", size=12)
+        
+        if description:
+            pdf.multi_cell(0, 10, txt=description)
+        
+        if table_content:
+            # Convert markdown table to list of lists
+            rows = [row.split('|') for row in table_content.split('\n') if row.strip()]
+            if len(rows) > 1:
+                # Clean up headers and separators
+                headers = [h.strip() for h in rows[0][1:-1]]
+                data_rows = rows[2:]
+                
+                # Create table
+                col_widths = [pdf.get_string_width(header) + 6 for header in headers]
+                
+                # Headers
+                pdf.set_font("Arial", 'B', 12)
+                for i, header in enumerate(headers):
+                    pdf.cell(col_widths[i], 10, txt=header, border=1)
+                pdf.ln()
+                
+                # Data rows
+                pdf.set_font("Arial", size=10)
+                for row in data_rows:
+                    cells = [cell.strip() for cell in row[1:-1]]
+                    for i, cell in enumerate(cells):
+                        pdf.cell(col_widths[i], 10, txt=cell, border=1)
+                    pdf.ln()
+        
+        pdf.ln(5)
+    
+    # Save to bytes buffer
+    pdf_bytes = BytesIO()
+    pdf_bytes.write(pdf.output(dest='S').encode('latin1'))
+    pdf_bytes.seek(0)
+    return pdf_bytes
+
+def create_markdown(report_sections):
+    """Generate Markdown report with proper formatting"""
+    md_content = "# Data Analysis Report\n\n"
+    for title, description, table_content in report_sections:
+        md_content += f"## {title}\n\n"
+        if description:
+            md_content += f"{description}\n\n"
+        if table_content:
+            md_content += f"{table_content}\n\n"
+    return md_content
+
+def main():
+    st.set_page_config(
+        page_title="Automated Data Reporter", 
+        page_icon="📊", 
+        layout="wide"
+    )
+    
+    st.title("📊 Automated Data Analysis Reporter")
+    st.markdown("""
+    This app automatically analyzes your dataset and generates interactive reports.
+    Upload your CSV file to get started!
+    """)
+    
+    reporter = AutomatedDataReporter()
+    
+    # File upload
+    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+    if uploaded_file is not None:
+        reporter.load_data(uploaded_file)
+        
+        # Analysis steps
+        st.sidebar.header("Analysis Steps")
+        if st.sidebar.button("1. Clean Data"):
+            reporter.clean_data()
+        
+        if st.sidebar.button("2. Analyze Data"):
+            reporter.analyze_data()
+        
+        if st.sidebar.button("3. Generate Clusters"):
+            reporter.generate_clusters()
+        
+        if st.sidebar.button("4. Predict Target"):
+            reporter.predict_target()
+        
+        # Display full report
+        st.sidebar.markdown("---")
+        if st.sidebar.button("Generate Full Report"):
+            with st.expander("Full Analysis Report", expanded=True):
+                for title, description, table_content in st.session_state.report_sections:
+                    st.subheader(title)
+                    if description:
+                        st.write(description)
+                    if table_content:
+                        st.markdown(table_content)
+            
+            # Download buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                pdf_bytes = create_pdf(st.session_state.report_sections)
+                st.download_button(
+                    label="Download PDF Report",
+                    data=pdf_bytes,
+                    file_name="data_report.pdf",
+                    mime="application/pdf"
+                )
+            with col2:
+                st.download_button(
+                    label="Download Markdown Report",
+                    data=create_markdown(st.session_state.report_sections),
+                    file_name="data_report.md",
+                    mime="text/markdown"
+                )
+
+if __name__ == "__main__":
+    main()
